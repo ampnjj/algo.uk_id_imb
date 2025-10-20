@@ -912,6 +912,119 @@ class ElexonDISBSADFetcher:
         return df_aggregated
 
 
+class BmUnitsReferenceFetcher:
+    """
+    Fetch BM Units (Balancing Mechanism Units) reference data from Elexon BMRS API.
+
+    This is a static reference table, not time-series data.
+    Used as a lookup table for enriching other data sources.
+
+    API Endpoint: https://data.elexon.co.uk/bmrs/api/v1/reference/bmunits/all
+    """
+
+    BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1/reference/bmunits/all"
+
+    def __init__(self, max_retries=3, backoff_factor=1):
+        """
+        Initialize the BM Units reference fetcher.
+
+        Args:
+            max_retries: Maximum number of retry attempts for failed requests
+            backoff_factor: Base factor for exponential backoff (seconds)
+        """
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.logger = logging.getLogger(__name__)
+
+    def fetch_bmunits(self):
+        """
+        Fetch all BM Units reference data.
+
+        Returns:
+            pd.DataFrame with columns: nationalGridBmUnit, bmUnitType
+        """
+        self.logger.info("Fetching BM Units reference data from Elexon BMRS API...")
+
+        # Make request with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Build request parameters
+                params = {
+                    'format': 'json'
+                }
+
+                # Make GET request
+                response = requests.get(self.BASE_URL, params=params, timeout=60)
+                response.raise_for_status()
+
+                # Parse JSON response
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    self.logger.warning(f"JSON parsing failed: {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.backoff_factor * (2 ** attempt))
+                        continue
+                    return pd.DataFrame()
+
+                # The response might be a list or have a 'data' key
+                if isinstance(data, list):
+                    records = data
+                elif isinstance(data, dict) and 'data' in data:
+                    records = data['data']
+                else:
+                    self.logger.warning(f"Unexpected response format: {type(data)}")
+                    return pd.DataFrame()
+
+                if not records:
+                    self.logger.warning("Empty data array in response")
+                    return pd.DataFrame()
+
+                # Convert to DataFrame
+                df = pd.DataFrame(records)
+
+                # Check required columns exist
+                required_cols = ['nationalGridBmUnit', 'bmUnitType']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+
+                if missing_cols:
+                    self.logger.warning(f"Missing columns {missing_cols} in response")
+                    # Show available columns for debugging
+                    self.logger.info(f"Available columns: {list(df.columns)}")
+                    return pd.DataFrame()
+
+                # Select only required columns
+                df_result = df[required_cols].copy()
+
+                # Remove duplicates (keep first occurrence)
+                initial_rows = len(df_result)
+                df_result = df_result.drop_duplicates(subset=['nationalGridBmUnit'], keep='first')
+                duplicates_removed = initial_rows - len(df_result)
+
+                if duplicates_removed > 0:
+                    self.logger.info(f"Removed {duplicates_removed} duplicate BM Units")
+
+                # Sort by nationalGridBmUnit for consistency
+                df_result = df_result.sort_values('nationalGridBmUnit').reset_index(drop=True)
+
+                self.logger.info(f"Successfully fetched {len(df_result)} BM Units")
+                return df_result
+
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+
+                if attempt < self.max_retries - 1:
+                    # Exponential backoff
+                    sleep_time = self.backoff_factor * (2 ** attempt)
+                    self.logger.info(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    self.logger.error("All retry attempts failed")
+                    return pd.DataFrame()
+
+        return pd.DataFrame()
+
+
 class DataBuilder:
     """
     Build and prepare time series data for forecasting.
@@ -1124,6 +1237,37 @@ class DataBuilder:
 
         self.logger.info(f"Source 5 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         self.logger.info(f"Settlement date range: {df['settlementDate'].min()} to {df['settlementDate'].max()}")
+
+        return df
+
+    def load_source_6(self):
+        """
+        Load BM Units reference data from Elexon BMRS API (Source 6).
+
+        This is a REFERENCE TABLE, not time-series data.
+        Returns a static lookup table with BM Unit metadata.
+
+        NOTE: This source is NOT merged with time-series data (Sources 1-5).
+              It is saved separately as a reference file for use in Source 7.
+
+        Returns:
+            pd.DataFrame with columns: nationalGridBmUnit, bmUnitType
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Loading Source 6: BM Units Reference Data")
+        self.logger.info("=" * 60)
+
+        # Initialize fetcher
+        fetcher = BmUnitsReferenceFetcher()
+
+        # Fetch BM Units reference data
+        df = fetcher.fetch_bmunits()
+
+        if df.empty:
+            raise ValueError("No data fetched from BM Units Reference API")
+
+        self.logger.info(f"Source 6 loaded successfully: {len(df)} BM Units, {len(df.columns)} columns")
+        self.logger.info(f"Sample BM Units: {df['nationalGridBmUnit'].head(5).tolist()}")
 
         return df
 
@@ -1341,6 +1485,7 @@ class DataBuilder:
             output_path: Path to save the final CSV
             load_sources: List of source numbers to load (e.g., [1, 2])
                          Note: You need to implement load_source_N methods for your data sources
+                         Special: Source 6 is a reference table and is handled separately
             require_premium: If True, validate that premium column exists in final dataset
 
         Returns:
@@ -1357,8 +1502,39 @@ class DataBuilder:
                 "and pass the source numbers via --sources argument."
             )
 
-        # Load first source as primary
-        first_source = load_sources[0]
+        # Special handling for Source 6 (BM Units reference data)
+        # Source 6 is a reference table, not time-series data, so handle it separately
+        if load_sources == [6]:
+            self.logger.info("\nLoading Source 6 (Reference Data Only)...")
+            loader_method = getattr(self, "load_source_6", None)
+
+            if loader_method is None:
+                raise ValueError("Source 6 not implemented.")
+
+            df = loader_method()
+
+            # For Source 6, skip cleaning/validation and just save directly
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_path, index=False)
+
+            self.logger.info(f"✓ Reference data saved to {output_path}")
+            self.logger.info(f"  - {len(df)} BM Units, {len(df.columns)} columns")
+            self.logger.info("\n" + "=" * 60)
+            self.logger.info("Reference data download completed successfully!")
+            self.logger.info("=" * 60)
+
+            self.df = df
+            return df
+
+        # Filter out Source 6 from regular time-series processing
+        timeseries_sources = [s for s in load_sources if s != 6]
+
+        if not timeseries_sources:
+            raise ValueError("No time-series sources specified (only Source 6 was requested)")
+
+        # Load first time-series source as primary
+        first_source = timeseries_sources[0]
         loader_method = getattr(self, f"load_source_{first_source}", None)
 
         if loader_method is None:
@@ -1370,8 +1546,8 @@ class DataBuilder:
         self.logger.info(f"\nLoading primary source {first_source}...")
         df = loader_method()
 
-        # Load and merge additional sources if specified
-        for source_num in load_sources[1:]:
+        # Load and merge additional time-series sources if specified
+        for source_num in timeseries_sources[1:]:
             self.logger.info(f"\nLoading source {source_num}...")
             loader_method = getattr(self, f"load_source_{source_num}", None)
 
