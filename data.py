@@ -202,23 +202,19 @@ class ElexonDemandForecastFetcher:
         self.backoff_factor = backoff_factor
         self.logger = logging.getLogger(__name__)
 
-    def fetch_for_settlement_period(self, start_time):
+    def _fetch_with_publish_time(self, start_time, hours_before):
         """
-        Fetch demand forecast for a specific settlement period.
+        Helper method: Fetch demand forecast with a specific publish time offset.
 
         Args:
             start_time: datetime object for the settlement period start time (UTC)
+            hours_before: int, how many hours before startTime to use as publishTime
 
         Returns:
-            pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
-                                      transmissionSystemDemand, nationalDemand
+            pd.DataFrame with demand forecast data, or empty DataFrame if not found
         """
-        # Calculate publish time: 1 hour before startTime
-        publish_time = start_time - timedelta(hours=1)
+        publish_time = start_time - timedelta(hours=hours_before)
         publish_time_str = publish_time.strftime('%Y-%m-%dT%H:%M')
-
-        self.logger.info(f"Fetching demand forecast for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
-                        f"(publishTime={publish_time_str})")
 
         # Make request with retries
         for attempt in range(self.max_retries):
@@ -237,7 +233,7 @@ class ElexonDemandForecastFetcher:
                 try:
                     data = response.json()
                 except ValueError as e:
-                    self.logger.warning(f"JSON parsing failed for {start_time}: {e}")
+                    self.logger.warning(f"JSON parsing failed for {start_time} (publishTime=-{hours_before}h): {e}")
                     if attempt < self.max_retries - 1:
                         time.sleep(self.backoff_factor * (2 ** attempt))
                         continue
@@ -245,13 +241,13 @@ class ElexonDemandForecastFetcher:
 
                 # Extract data array
                 if 'data' not in data or not isinstance(data['data'], list):
-                    self.logger.warning(f"No data array found in response for {start_time}")
+                    self.logger.warning(f"No data array found in response for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 records = data['data']
 
                 if not records:
-                    self.logger.warning(f"Empty data array for {start_time}")
+                    self.logger.warning(f"Empty data array for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Convert to DataFrame
@@ -264,7 +260,7 @@ class ElexonDemandForecastFetcher:
                 df_filtered = df[df['startTime'] == start_time].copy()
 
                 if df_filtered.empty:
-                    self.logger.warning(f"No matching startTime {start_time} in response")
+                    self.logger.warning(f"No matching startTime {start_time} in response (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Check required columns exist
@@ -273,7 +269,7 @@ class ElexonDemandForecastFetcher:
                 missing_cols = [col for col in required_cols if col not in df_filtered.columns]
 
                 if missing_cols:
-                    self.logger.warning(f"Missing columns {missing_cols} for {start_time}")
+                    self.logger.warning(f"Missing columns {missing_cols} for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Select required columns
@@ -287,7 +283,8 @@ class ElexonDemandForecastFetcher:
                 return df_result
 
             except requests.exceptions.RequestException as e:
-                self.logger.warning(f"Request failed for {start_time} (attempt {attempt + 1}/{self.max_retries}): {e}")
+                self.logger.warning(f"Request failed for {start_time} (publishTime=-{hours_before}h, "
+                                   f"attempt {attempt + 1}/{self.max_retries}): {e}")
 
                 if attempt < self.max_retries - 1:
                     # Exponential backoff
@@ -295,10 +292,36 @@ class ElexonDemandForecastFetcher:
                     self.logger.info(f"Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
-                    self.logger.error(f"All retry attempts failed for {start_time}")
+                    self.logger.error(f"All retry attempts failed for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
         return pd.DataFrame()
+
+    def fetch_for_settlement_period(self, start_time):
+        """
+        Fetch demand forecast for a specific settlement period.
+
+        Tries publishTime = startTime - 1 hour first, falls back to -2 hours if no data found.
+
+        Args:
+            start_time: datetime object for the settlement period start time (UTC)
+
+        Returns:
+            pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
+                                      transmissionSystemDemand, nationalDemand
+        """
+        self.logger.info(f"Fetching demand forecast for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
+                        f"(publishTime={start_time - timedelta(hours=1):%Y-%m-%dT%H:%M})")
+
+        # Try 1 hour before startTime first
+        df = self._fetch_with_publish_time(start_time, hours_before=1)
+
+        if df.empty:
+            # Fallback: try 2 hours before startTime
+            self.logger.info(f"No data found with publishTime=-1h, trying -2h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=2)
+
+        return df
 
     def fetch_date_range(self, start_date, end_date):
         """
@@ -573,23 +596,19 @@ class ElexonIndicatedImbalanceFetcher:
         self.backoff_factor = backoff_factor
         self.logger = logging.getLogger(__name__)
 
-    def fetch_for_settlement_period(self, start_time):
+    def _fetch_with_publish_time(self, start_time, hours_before):
         """
-        Fetch indicated imbalance forecast for a specific settlement period.
+        Helper method: Fetch indicated imbalance forecast with a specific publish time offset.
 
         Args:
             start_time: datetime object for the settlement period start time (UTC)
+            hours_before: int, how many hours before startTime to use as publishTime
 
         Returns:
-            pd.DataFrame with columns: startTime, settlementPeriod,
-                                      indicatedGeneration, indicatedImbalance
+            pd.DataFrame with indicated imbalance data, or empty DataFrame if not found
         """
-        # Calculate publish time: 1 hour before startTime
-        publish_time = start_time - timedelta(hours=1)
+        publish_time = start_time - timedelta(hours=hours_before)
         publish_time_str = publish_time.strftime('%Y-%m-%dT%H:%M')
-
-        self.logger.info(f"Fetching indicated imbalance for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
-                        f"(publishTime={publish_time_str})")
 
         # Make request with retries
         for attempt in range(self.max_retries):
@@ -608,7 +627,7 @@ class ElexonIndicatedImbalanceFetcher:
                 try:
                     data = response.json()
                 except ValueError as e:
-                    self.logger.warning(f"JSON parsing failed for {start_time}: {e}")
+                    self.logger.warning(f"JSON parsing failed for {start_time} (publishTime=-{hours_before}h): {e}")
                     if attempt < self.max_retries - 1:
                         time.sleep(self.backoff_factor * (2 ** attempt))
                         continue
@@ -616,13 +635,13 @@ class ElexonIndicatedImbalanceFetcher:
 
                 # Extract data array
                 if 'data' not in data or not isinstance(data['data'], list):
-                    self.logger.warning(f"No data array found in response for {start_time}")
+                    self.logger.warning(f"No data array found in response for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 records = data['data']
 
                 if not records:
-                    self.logger.warning(f"Empty data array for {start_time}")
+                    self.logger.warning(f"Empty data array for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Convert to DataFrame
@@ -635,7 +654,7 @@ class ElexonIndicatedImbalanceFetcher:
                 df_filtered = df[df['startTime'] == start_time].copy()
 
                 if df_filtered.empty:
-                    self.logger.warning(f"No matching startTime {start_time} in response")
+                    self.logger.warning(f"No matching startTime {start_time} in response (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Check required columns exist
@@ -643,7 +662,7 @@ class ElexonIndicatedImbalanceFetcher:
                 missing_cols = [col for col in required_cols if col not in df_filtered.columns]
 
                 if missing_cols:
-                    self.logger.warning(f"Missing columns {missing_cols} for {start_time}")
+                    self.logger.warning(f"Missing columns {missing_cols} for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
                 # Select required columns
@@ -657,7 +676,8 @@ class ElexonIndicatedImbalanceFetcher:
                 return df_result
 
             except requests.exceptions.RequestException as e:
-                self.logger.warning(f"Request failed for {start_time} (attempt {attempt + 1}/{self.max_retries}): {e}")
+                self.logger.warning(f"Request failed for {start_time} (publishTime=-{hours_before}h, "
+                                   f"attempt {attempt + 1}/{self.max_retries}): {e}")
 
                 if attempt < self.max_retries - 1:
                     # Exponential backoff
@@ -665,10 +685,36 @@ class ElexonIndicatedImbalanceFetcher:
                     self.logger.info(f"Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
-                    self.logger.error(f"All retry attempts failed for {start_time}")
+                    self.logger.error(f"All retry attempts failed for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
         return pd.DataFrame()
+
+    def fetch_for_settlement_period(self, start_time):
+        """
+        Fetch indicated imbalance forecast for a specific settlement period.
+
+        Tries publishTime = startTime - 1 hour first, falls back to -2 hours if no data found.
+
+        Args:
+            start_time: datetime object for the settlement period start time (UTC)
+
+        Returns:
+            pd.DataFrame with columns: startTime, settlementPeriod,
+                                      indicatedGeneration, indicatedImbalance
+        """
+        self.logger.info(f"Fetching indicated imbalance for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
+                        f"(publishTime={start_time - timedelta(hours=1):%Y-%m-%dT%H:%M})")
+
+        # Try 1 hour before startTime first
+        df = self._fetch_with_publish_time(start_time, hours_before=1)
+
+        if df.empty:
+            # Fallback: try 2 hours before startTime
+            self.logger.info(f"No data found with publishTime=-1h, trying -2h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=2)
+
+        return df
 
     def fetch_date_range(self, start_date, end_date):
         """
@@ -861,7 +907,7 @@ class ElexonDISBSADFetcher:
             batch_size: Number of days to fetch per API call (default: 10)
 
         Returns:
-            pd.DataFrame with columns: settlementDate, settlementPeriod, totalVolume
+            pd.DataFrame with columns: settlementDate, settlementPeriod, totalBSAD
                                       (aggregated by settlementDate + settlementPeriod)
         """
         # Convert strings to datetime.date if needed
@@ -899,14 +945,14 @@ class ElexonDISBSADFetcher:
         # Concatenate all results
         if not all_dfs:
             self.logger.warning("No data fetched for any batch")
-            return pd.DataFrame(columns=['settlementDate', 'settlementPeriod', 'totalVolume'])
+            return pd.DataFrame(columns=['settlementDate', 'settlementPeriod', 'totalBSAD'])
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
 
         # Aggregate volume by settlementDate + settlementPeriod
         self.logger.info(f"Aggregating {len(df_combined)} rows by settlementDate + settlementPeriod...")
         df_aggregated = df_combined.groupby(['settlementDate', 'settlementPeriod'], as_index=False)['volume'].sum()
-        df_aggregated = df_aggregated.rename(columns={'volume': 'totalVolume'})
+        df_aggregated = df_aggregated.rename(columns={'volume': 'totalBSAD'})
 
         # Sort by settlementDate and settlementPeriod
         df_aggregated = df_aggregated.sort_values(['settlementDate', 'settlementPeriod']).reset_index(drop=True)
@@ -1526,7 +1572,7 @@ class DataBuilder:
         Volume is aggregated (summed) by settlementDate + settlementPeriod.
 
         Returns:
-            pd.DataFrame with columns: settlementDate, settlementPeriod, totalVolume
+            pd.DataFrame with columns: settlementDate, settlementPeriod, totalBSAD
         """
         self.logger.info("=" * 60)
         self.logger.info("Loading Source 5: Elexon BMRS DISBSAD (Aggregated Volume)")
