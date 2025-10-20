@@ -49,7 +49,7 @@ class ElexonSystemPricesFetcher:
             settlement_date: datetime.date object for the settlement date
 
         Returns:
-            pd.DataFrame with columns: startTime, settlementPeriod, netImbalanceVolume
+            pd.DataFrame with columns: startTime, settlementDate, settlementPeriod, netImbalanceVolume
         """
         settlement_date_str = settlement_date.strftime('%Y-%m-%d')
 
@@ -95,7 +95,7 @@ class ElexonSystemPricesFetcher:
                 df = pd.DataFrame(records)
 
                 # Check required columns exist
-                required_cols = ['startTime', 'settlementPeriod', 'netImbalanceVolume']
+                required_cols = ['startTime', 'settlementDate', 'settlementPeriod', 'netImbalanceVolume']
                 missing_cols = [col for col in required_cols if col not in df.columns]
 
                 if missing_cols:
@@ -131,7 +131,7 @@ class ElexonSystemPricesFetcher:
             end_date: datetime.date or string (YYYY-MM-DD) for end date (inclusive)
 
         Returns:
-            pd.DataFrame with columns: startTime, settlementPeriod, netImbalanceVolume
+            pd.DataFrame with columns: startTime, settlementDate, settlementPeriod, netImbalanceVolume
         """
         # Convert strings to datetime.date if needed
         if isinstance(start_date, str):
@@ -741,6 +741,177 @@ class ElexonIndicatedImbalanceFetcher:
         return df_combined
 
 
+class ElexonDISBSADFetcher:
+    """
+    Fetch DISBSAD (Disaggregated Balancing Services Adjustment Data) from Elexon BMRS API.
+
+    This source aggregates volume by settlementDate and settlementPeriod.
+
+    API Endpoint: https://data.elexon.co.uk/bmrs/api/v1/datasets/DISBSAD/stream
+    """
+
+    BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1/datasets/DISBSAD/stream"
+
+    def __init__(self, max_retries=3, backoff_factor=1):
+        """
+        Initialize the Elexon DISBSAD fetcher.
+
+        Args:
+            max_retries: Maximum number of retry attempts for failed requests
+            backoff_factor: Base factor for exponential backoff (seconds)
+        """
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.logger = logging.getLogger(__name__)
+
+    def fetch_date_batch(self, start_date, end_date):
+        """
+        Fetch DISBSAD data for a date range (single API call).
+
+        Args:
+            start_date: datetime.date object for start date
+            end_date: datetime.date object for end date
+
+        Returns:
+            pd.DataFrame with columns: settlementDate, settlementPeriod, volume
+        """
+        # Format dates as ISO 8601 with time
+        start_datetime = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+
+        start_str = start_datetime.strftime('%Y-%m-%dT%H:%MZ')
+        end_str = end_datetime.strftime('%Y-%m-%dT%H:%MZ')
+
+        self.logger.info(f"Fetching DISBSAD data for {start_date} to {end_date}")
+
+        # Make request with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Build request parameters
+                params = {
+                    'from': start_str,
+                    'to': end_str
+                }
+
+                # Make GET request
+                response = requests.get(self.BASE_URL, params=params, timeout=60)
+                response.raise_for_status()
+
+                # Parse JSON response
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    self.logger.warning(f"JSON parsing failed for {start_date} to {end_date}: {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.backoff_factor * (2 ** attempt))
+                        continue
+                    return pd.DataFrame()
+
+                # The response is a list of records
+                if not isinstance(data, list):
+                    self.logger.warning(f"Unexpected response format for {start_date} to {end_date}")
+                    return pd.DataFrame()
+
+                if not data:
+                    self.logger.warning(f"Empty data array for {start_date} to {end_date}")
+                    return pd.DataFrame()
+
+                # Convert to DataFrame
+                df = pd.DataFrame(data)
+
+                # Check required columns exist
+                required_cols = ['settlementDate', 'settlementPeriod', 'volume']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+
+                if missing_cols:
+                    self.logger.warning(f"Missing columns {missing_cols} for {start_date} to {end_date}")
+                    return pd.DataFrame()
+
+                # Select required columns
+                df_result = df[required_cols].copy()
+
+                self.logger.info(f"Successfully fetched {len(df_result)} rows for {start_date} to {end_date}")
+                return df_result
+
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"Request failed for {start_date} to {end_date} (attempt {attempt + 1}/{self.max_retries}): {e}")
+
+                if attempt < self.max_retries - 1:
+                    # Exponential backoff
+                    sleep_time = self.backoff_factor * (2 ** attempt)
+                    self.logger.info(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    self.logger.error(f"All retry attempts failed for {start_date} to {end_date}")
+                    return pd.DataFrame()
+
+        return pd.DataFrame()
+
+    def fetch_date_range(self, start_date, end_date, batch_size=10):
+        """
+        Fetch DISBSAD data for a date range with batching and volume aggregation.
+
+        Args:
+            start_date: datetime.date or string (YYYY-MM-DD) for start date (inclusive)
+            end_date: datetime.date or string (YYYY-MM-DD) for end date (inclusive)
+            batch_size: Number of days to fetch per API call (default: 10)
+
+        Returns:
+            pd.DataFrame with columns: settlementDate, settlementPeriod, totalVolume
+                                      (aggregated by settlementDate + settlementPeriod)
+        """
+        # Convert strings to datetime.date if needed
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        self.logger.info(f"Fetching Elexon DISBSAD data from {start_date} to {end_date}")
+
+        # Calculate total API calls
+        num_days = (end_date - start_date).days + 1
+        num_batches = (num_days + batch_size - 1) // batch_size  # Ceiling division
+        self.logger.info(f"Expected API calls: {num_batches} (fetching {num_days} days in batches of {batch_size})")
+
+        # Collect all DataFrames
+        all_dfs = []
+
+        # Iterate over date range in batches
+        current_date = start_date
+        while current_date <= end_date:
+            batch_end = min(current_date + timedelta(days=batch_size - 1), end_date)
+
+            # Fetch batch
+            df_batch = self.fetch_date_batch(current_date, batch_end)
+
+            if not df_batch.empty:
+                all_dfs.append(df_batch)
+
+            # Small delay to avoid overwhelming the API
+            time.sleep(0.5)
+
+            current_date = batch_end + timedelta(days=1)
+
+        # Concatenate all results
+        if not all_dfs:
+            self.logger.warning("No data fetched for any batch")
+            return pd.DataFrame(columns=['settlementDate', 'settlementPeriod', 'totalVolume'])
+
+        df_combined = pd.concat(all_dfs, ignore_index=True)
+
+        # Aggregate volume by settlementDate + settlementPeriod
+        self.logger.info(f"Aggregating {len(df_combined)} rows by settlementDate + settlementPeriod...")
+        df_aggregated = df_combined.groupby(['settlementDate', 'settlementPeriod'], as_index=False)['volume'].sum()
+        df_aggregated = df_aggregated.rename(columns={'volume': 'totalVolume'})
+
+        # Sort by settlementDate and settlementPeriod
+        df_aggregated = df_aggregated.sort_values(['settlementDate', 'settlementPeriod']).reset_index(drop=True)
+
+        self.logger.info(f"Total aggregated rows: {len(df_aggregated)}")
+
+        return df_aggregated
+
+
 class DataBuilder:
     """
     Build and prepare time series data for forecasting.
@@ -773,7 +944,7 @@ class DataBuilder:
         in __init__ (self.start_date to self.end_date).
 
         Returns:
-            pd.DataFrame with columns: valueDateTimeOffset, settlementPeriod, netImbalanceVolume
+            pd.DataFrame with columns: valueDateTimeOffset, settlementDate, settlementPeriod, netImbalanceVolume
         """
         self.logger.info("=" * 60)
         self.logger.info("Loading Source 1: Elexon BMRS System Prices (Net Imbalance Volume)")
@@ -796,7 +967,7 @@ class DataBuilder:
         df = df.drop(columns=['startTime'])
 
         # Reorder columns: valueDateTimeOffset first, then features
-        df = df[['valueDateTimeOffset', 'settlementPeriod', 'netImbalanceVolume']]
+        df = df[['valueDateTimeOffset', 'settlementDate', 'settlementPeriod', 'netImbalanceVolume']]
 
         self.logger.info(f"Source 1 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         self.logger.info(f"Date range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
@@ -926,6 +1097,36 @@ class DataBuilder:
 
         return df
 
+    def load_source_5(self):
+        """
+        Load data from Elexon BMRS DISBSAD API (Source 5).
+
+        Fetches Disaggregated Balancing Services Adjustment Data for the date range
+        specified in __init__ (self.start_date to self.end_date).
+
+        Volume is aggregated (summed) by settlementDate + settlementPeriod.
+
+        Returns:
+            pd.DataFrame with columns: settlementDate, settlementPeriod, totalVolume
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Loading Source 5: Elexon BMRS DISBSAD (Aggregated Volume)")
+        self.logger.info("=" * 60)
+
+        # Initialize fetcher
+        fetcher = ElexonDISBSADFetcher()
+
+        # Fetch data for date range (with 10-day batching and aggregation)
+        df = fetcher.fetch_date_range(self.start_date, self.end_date, batch_size=10)
+
+        if df.empty:
+            raise ValueError("No data fetched from Elexon DISBSAD API")
+
+        self.logger.info(f"Source 5 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+        self.logger.info(f"Settlement date range: {df['settlementDate'].min()} to {df['settlementDate'].max()}")
+
+        return df
+
     def merge_sources(self, df1, df2, merge_type='left'):
         """
         Merge multiple data sources on timestamp and settlement period.
@@ -940,20 +1141,35 @@ class DataBuilder:
         """
         self.logger.info(f"Merging data sources with {merge_type} join...")
 
-        # Determine join keys (use both timestamp and settlementPeriod if available)
-        join_keys = ['valueDateTimeOffset']
-        if 'settlementPeriod' in df1.columns and 'settlementPeriod' in df2.columns:
-            join_keys.append('settlementPeriod')
+        # Check if df2 is Source 5 (DISBSAD) which uses settlementDate instead of valueDateTimeOffset
+        if 'valueDateTimeOffset' not in df2.columns and 'settlementDate' in df2.columns:
+            # Source 5: merge on settlementDate + settlementPeriod
+            join_keys = ['settlementDate', 'settlementPeriod']
+            self.logger.info(f"Merging on: {join_keys} (Source 5 detected)")
+
+            # Merge on join keys
+            merged_df = pd.merge(
+                df1,
+                df2,
+                on=join_keys,
+                how=merge_type,
+                suffixes=('', '_source2')
+            )
+        else:
+            # Standard merge: use valueDateTimeOffset + settlementPeriod
+            join_keys = ['valueDateTimeOffset']
+            if 'settlementPeriod' in df1.columns and 'settlementPeriod' in df2.columns:
+                join_keys.append('settlementPeriod')
             self.logger.info(f"Merging on: {join_keys}")
 
-        # Merge on join keys
-        merged_df = pd.merge(
-            df1,
-            df2,
-            on=join_keys,
-            how=merge_type,
-            suffixes=('', '_source2')
-        )
+            # Merge on join keys
+            merged_df = pd.merge(
+                df1,
+                df2,
+                on=join_keys,
+                how=merge_type,
+                suffixes=('', '_source2')
+            )
 
         self.logger.info(f"Merged dataset shape: {merged_df.shape}")
         return merged_df
@@ -972,8 +1188,20 @@ class DataBuilder:
         """
         self.logger.info("Validating dataset...")
 
-        # Check required timestamp column
-        required_cols = ['valueDateTimeOffset']
+        # Determine which timestamp columns to check
+        if 'valueDateTimeOffset' in df.columns:
+            # Standard dataset with valueDateTimeOffset
+            required_cols = ['valueDateTimeOffset']
+            timestamp_col = 'valueDateTimeOffset'
+            duplicate_check_cols = ['valueDateTimeOffset']
+        elif 'settlementDate' in df.columns and 'settlementPeriod' in df.columns:
+            # Source 5 only dataset
+            required_cols = ['settlementDate', 'settlementPeriod']
+            timestamp_col = None
+            duplicate_check_cols = ['settlementDate', 'settlementPeriod']
+        else:
+            raise ValueError("DataFrame must have either 'valueDateTimeOffset' or 'settlementDate'+'settlementPeriod'")
+
         if require_premium:
             required_cols.append('premium')
 
@@ -982,13 +1210,14 @@ class DataBuilder:
         if missing_cols:
             raise ValueError(f"Missing required columns: {missing_cols}")
 
-        # Check timestamp format
-        if not pd.api.types.is_datetime64_any_dtype(df['valueDateTimeOffset']):
-            raise ValueError("valueDateTimeOffset must be datetime type")
+        # Check timestamp format (only for valueDateTimeOffset)
+        if timestamp_col:
+            if not pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
+                raise ValueError(f"{timestamp_col} must be datetime type")
 
-        # Check for timezone awareness
-        if df['valueDateTimeOffset'].dt.tz is None:
-            raise ValueError("valueDateTimeOffset must be timezone-aware (UTC)")
+            # Check for timezone awareness
+            if df[timestamp_col].dt.tz is None:
+                raise ValueError(f"{timestamp_col} must be timezone-aware (UTC)")
 
         # Check premium is numeric (only if required)
         if require_premium:
@@ -996,15 +1225,20 @@ class DataBuilder:
                 raise ValueError("premium must be numeric type")
 
         # Check for duplicates
-        duplicates = df.duplicated(subset=['valueDateTimeOffset']).sum()
+        duplicates = df.duplicated(subset=duplicate_check_cols).sum()
         if duplicates > 0:
             self.logger.warning(f"Found {duplicates} duplicate timestamps")
 
         # Check for missing values
-        missing_timestamp = df['valueDateTimeOffset'].isna().sum()
-
-        if missing_timestamp > 0:
-            self.logger.warning(f"Found {missing_timestamp} missing timestamps")
+        if timestamp_col:
+            missing_timestamp = df[timestamp_col].isna().sum()
+            if missing_timestamp > 0:
+                self.logger.warning(f"Found {missing_timestamp} missing timestamps")
+        else:
+            missing_date = df['settlementDate'].isna().sum()
+            missing_period = df['settlementPeriod'].isna().sum()
+            if missing_date > 0 or missing_period > 0:
+                self.logger.warning(f"Found {missing_date} missing settlementDates, {missing_period} missing settlementPeriods")
 
         if require_premium:
             missing_premium = df['premium'].isna().sum()
@@ -1013,7 +1247,12 @@ class DataBuilder:
 
         self.logger.info("✓ Dataset validation passed")
         self.logger.info(f"  - Shape: {df.shape}")
-        self.logger.info(f"  - Time range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
+
+        if timestamp_col:
+            self.logger.info(f"  - Time range: {df[timestamp_col].min()} to {df[timestamp_col].max()}")
+        else:
+            self.logger.info(f"  - Settlement date range: {df['settlementDate'].min()} to {df['settlementDate'].max()}")
+
         self.logger.info(f"  - Columns: {list(df.columns)}")
 
         return True
@@ -1034,18 +1273,37 @@ class DataBuilder:
 
         initial_rows = len(df)
 
+        # Determine which timestamp column to use
+        if 'valueDateTimeOffset' in df.columns:
+            timestamp_col = 'valueDateTimeOffset'
+            sort_cols = ['valueDateTimeOffset']
+        elif 'settlementDate' in df.columns and 'settlementPeriod' in df.columns:
+            # Source 5 only - use settlementDate + settlementPeriod
+            timestamp_col = None
+            sort_cols = ['settlementDate', 'settlementPeriod']
+        else:
+            raise ValueError("DataFrame must have either 'valueDateTimeOffset' or 'settlementDate'+'settlementPeriod'")
+
         # Remove rows with missing timestamps
-        drop_cols = ['valueDateTimeOffset']
+        drop_cols = []
+        if timestamp_col:
+            drop_cols.append(timestamp_col)
+        else:
+            drop_cols.extend(['settlementDate', 'settlementPeriod'])
+
         if require_premium and 'premium' in df.columns:
             drop_cols.append('premium')
 
         df = df.dropna(subset=drop_cols)
 
         # Remove duplicate timestamps (keep last)
-        df = df.drop_duplicates(subset=['valueDateTimeOffset'], keep='last')
+        if timestamp_col:
+            df = df.drop_duplicates(subset=[timestamp_col], keep='last')
+        else:
+            df = df.drop_duplicates(subset=['settlementDate', 'settlementPeriod'], keep='last')
 
         # Sort by timestamp
-        df = df.sort_values('valueDateTimeOffset').reset_index(drop=True)
+        df = df.sort_values(sort_cols).reset_index(drop=True)
 
         removed_rows = initial_rows - len(df)
         if removed_rows > 0:
