@@ -1,5 +1,7 @@
 pandas>=1.5.0
 numpy>=1.21.0
+polars>=0.20.0
+numba>=0.56.0
 scikit-learn>=1.1.0
 lightgbm>=3.3.0
 xgboost>=1.6.0
