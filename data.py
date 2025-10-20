@@ -1108,14 +1108,14 @@ def process_fpn_to_30min(bmu_data_pd, pn_data_pd):
     - Returns only production data (prepared_prod_pl equivalent)
     - Aggregates all BMU columns into totalProduction
     - Resamples to 30-min intervals
-    - Returns DataFrame with valueDateTimeOffset, settlementPeriod, totalProduction
+    - Returns DataFrame with valueDateTimeOffset, totalProduction (no settlementPeriod)
 
     Args:
         bmu_data_pd: pandas DataFrame with BMU reference (nationalGridBmUnit, bmUnitType)
         pn_data_pd: pandas DataFrame with PN data
 
     Returns:
-        pandas DataFrame with 30-min aggregated production data
+        pandas DataFrame with columns: valueDateTimeOffset, totalProduction
     """
     try:
         if bmu_data_pd.empty or pn_data_pd.empty:
@@ -1171,26 +1171,10 @@ def process_fpn_to_30min(bmu_data_pd, pn_data_pd):
         resampled_pd = resampled_pd.reset_index()
         resampled_pd = resampled_pd.rename(columns={'startTime': 'valueDateTimeOffset'})
 
-        # Add settlementPeriod (1-48) based on time of day
-        # Period 1 starts at 23:00 previous day
-        def get_settlement_period(dt):
-            # Adjust: if time < 23:00, it's current day's period
-            # if time >= 23:00, it's next day's period 1
-            hour = dt.hour
-            minute = dt.minute
-            minutes_since_midnight = hour * 60 + minute
-
-            # Settlement period 1 starts at 23:00 (1380 minutes since midnight)
-            # But we need to handle day boundaries
-            if minutes_since_midnight >= 1380:  # >= 23:00
-                period = 1
-            else:
-                # Each period is 30 minutes starting from 23:00 previous day
-                period = ((minutes_since_midnight + 60) // 30) + 1
-
-            return min(max(period, 1), 48)
-
-        resampled_pd['settlementPeriod'] = resampled_pd['valueDateTimeOffset'].apply(get_settlement_period)
+        # Note: We don't add settlementPeriod here because:
+        # 1. Settlement period calculation is complex (period 1 starts at 23:00 previous day)
+        # 2. The merge logic will use valueDateTimeOffset only if settlementPeriod is missing
+        # 3. This avoids mismatches with other sources that use API-provided settlementPeriod
 
         # Return pandas DataFrame (keep compatible with existing infrastructure)
         logger.info(f"FPN processing complete: {len(resampled_pd)} 30-min intervals")
@@ -1231,6 +1215,9 @@ class ElexonPNFetcher:
         """
         Fetch PN data for a single day.
 
+        Note: The Elexon API requires querying across day boundaries to get complete data.
+        We fetch from 'date' to 'date+1' and filter by settlementDate to get all 48 periods.
+
         Args:
             date: datetime.date object
 
@@ -1241,13 +1228,17 @@ class ElexonPNFetcher:
         # Format date as YYYY-MM-DD
         date_str = date.strftime('%Y-%m-%d')
 
-        self.logger.info(f"Fetching PN data for {date_str}")
+        # Add 1-day buffer to get complete data (settlement period 1 starts at 23:00 previous day)
+        next_date = date + timedelta(days=1)
+        next_date_str = next_date.strftime('%Y-%m-%d')
+
+        self.logger.info(f"Fetching PN data for {date_str} (querying to {next_date_str} for complete coverage)")
 
         for attempt in range(self.max_retries):
             try:
                 params = {
                     'from': date_str,
-                    'to': date_str,
+                    'to': next_date_str,  # Query next day to get all 48 periods
                     'format': 'json'
                 }
 
@@ -1276,7 +1267,10 @@ class ElexonPNFetcher:
 
                 df_result = df[required_cols].copy()
 
-                self.logger.info(f"Successfully fetched {len(df_result)} PN records for {date_str}")
+                # Filter to only include records for the requested settlementDate
+                df_result = df_result[df_result['settlementDate'] == date_str]
+
+                self.logger.info(f"Successfully fetched {len(df_result)} PN records for {date_str} (all 48 periods)")
                 return df_result
 
             except requests.exceptions.RequestException as e:
@@ -1593,7 +1587,8 @@ class DataBuilder:
         Requires: Source 6 (BMU reference) must be downloaded first.
 
         Returns:
-            pd.DataFrame with columns: valueDateTimeOffset, settlementPeriod, totalProduction
+            pd.DataFrame with columns: valueDateTimeOffset, totalProduction
+            Note: settlementPeriod is NOT included to avoid merge conflicts
         """
         self.logger.info("=" * 60)
         self.logger.info("Loading Source 7: Physical Notification (FPN) Data")
