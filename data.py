@@ -177,6 +177,200 @@ class ElexonSystemPricesFetcher:
         return df_combined
 
 
+class ElexonDemandForecastFetcher:
+    """
+    Fetch day-ahead demand forecast data from Elexon BMRS API.
+
+    API Endpoint: https://data.elexon.co.uk/bmrs/api/v1/forecast/demand/day-ahead/history
+    """
+
+    BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1/forecast/demand/day-ahead/history"
+
+    def __init__(self, max_retries=3, backoff_factor=1):
+        """
+        Initialize the Elexon Demand Forecast fetcher.
+
+        Args:
+            max_retries: Maximum number of retry attempts for failed requests
+            backoff_factor: Base factor for exponential backoff (seconds)
+        """
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.logger = logging.getLogger(__name__)
+
+    def fetch_for_settlement_period(self, start_time):
+        """
+        Fetch demand forecast for a specific settlement period.
+
+        Args:
+            start_time: datetime object for the settlement period start time (UTC)
+
+        Returns:
+            pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
+                                      transmissionSystemDemand, nationalDemand
+        """
+        # Calculate publish time: 1 hour before startTime
+        publish_time = start_time - timedelta(hours=1)
+        publish_time_str = publish_time.strftime('%Y-%m-%dT%H:%M')
+
+        self.logger.info(f"Fetching demand forecast for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
+                        f"(publishTime={publish_time_str})")
+
+        # Make request with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Build request parameters
+                params = {
+                    'publishTime': publish_time_str,
+                    'format': 'json'
+                }
+
+                # Make GET request
+                response = requests.get(self.BASE_URL, params=params, timeout=30)
+                response.raise_for_status()
+
+                # Parse JSON response
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    self.logger.warning(f"JSON parsing failed for {start_time}: {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.backoff_factor * (2 ** attempt))
+                        continue
+                    return pd.DataFrame()
+
+                # Extract data array
+                if 'data' not in data or not isinstance(data['data'], list):
+                    self.logger.warning(f"No data array found in response for {start_time}")
+                    return pd.DataFrame()
+
+                records = data['data']
+
+                if not records:
+                    self.logger.warning(f"Empty data array for {start_time}")
+                    return pd.DataFrame()
+
+                # Convert to DataFrame
+                df = pd.DataFrame(records)
+
+                # Convert startTime to datetime for filtering
+                df['startTime'] = pd.to_datetime(df['startTime'], utc=True)
+
+                # Filter to the exact startTime we're looking for
+                df_filtered = df[df['startTime'] == start_time].copy()
+
+                if df_filtered.empty:
+                    self.logger.warning(f"No matching startTime {start_time} in response")
+                    return pd.DataFrame()
+
+                # Check required columns exist
+                required_cols = ['startTime', 'settlementPeriod', 'publishTime',
+                               'transmissionSystemDemand', 'nationalDemand']
+                missing_cols = [col for col in required_cols if col not in df_filtered.columns]
+
+                if missing_cols:
+                    self.logger.warning(f"Missing columns {missing_cols} for {start_time}")
+                    return pd.DataFrame()
+
+                # Select required columns
+                df_result = df_filtered[required_cols].copy()
+
+                # Take the first row if there are multiple matches (should be only one)
+                if len(df_result) > 1:
+                    self.logger.info(f"Multiple rows found for {start_time}, taking first")
+                    df_result = df_result.iloc[:1]
+
+                return df_result
+
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"Request failed for {start_time} (attempt {attempt + 1}/{self.max_retries}): {e}")
+
+                if attempt < self.max_retries - 1:
+                    # Exponential backoff
+                    sleep_time = self.backoff_factor * (2 ** attempt)
+                    self.logger.info(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    self.logger.error(f"All retry attempts failed for {start_time}")
+                    return pd.DataFrame()
+
+        return pd.DataFrame()
+
+    def fetch_date_range(self, start_date, end_date):
+        """
+        Fetch demand forecasts for a date range.
+
+        Args:
+            start_date: datetime.date or string (YYYY-MM-DD) for start date (inclusive)
+            end_date: datetime.date or string (YYYY-MM-DD) for end date (inclusive)
+
+        Returns:
+            pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
+                                      transmissionSystemDemand, nationalDemand
+        """
+        # Convert strings to datetime.date if needed
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        self.logger.info(f"Fetching Elexon Demand Forecast data from {start_date} to {end_date}")
+
+        # Calculate total API calls
+        num_days = (end_date - start_date).days + 1
+        total_calls = num_days * 48  # 48 settlement periods per day
+        self.logger.info(f"Expected API calls: {total_calls} ({num_days} days × 48 settlement periods)")
+
+        # Collect all DataFrames
+        all_dfs = []
+
+        # Iterate over date range (inclusive)
+        current_date = start_date
+        while current_date <= end_date:
+            # Generate all 48 settlement periods for this date
+            # Settlement period 1 starts at 23:00 on previous day
+            base_time = datetime.combine(current_date, datetime.min.time())
+            base_time = base_time.replace(tzinfo=timezone.utc) - timedelta(hours=1)  # Start at 23:00 previous day
+
+            for period in range(1, 49):  # Periods 1-48
+                # Calculate start time for this settlement period (30-minute intervals)
+                start_time = base_time + timedelta(minutes=(period - 1) * 30)
+
+                # Fetch data for this settlement period
+                df_period = self.fetch_for_settlement_period(start_time)
+
+                if not df_period.empty:
+                    all_dfs.append(df_period)
+
+                # Small delay to avoid overwhelming the API
+                time.sleep(0.1)
+
+            current_date += timedelta(days=1)
+
+        # Concatenate all results
+        if not all_dfs:
+            self.logger.warning("No data fetched for any settlement period")
+            return pd.DataFrame(columns=['startTime', 'settlementPeriod', 'publishTime',
+                                        'transmissionSystemDemand', 'nationalDemand'])
+
+        df_combined = pd.concat(all_dfs, ignore_index=True)
+
+        # Drop duplicates by startTime and settlementPeriod (should not be any)
+        initial_rows = len(df_combined)
+        df_combined = df_combined.drop_duplicates(subset=['startTime', 'settlementPeriod'], keep='last')
+        duplicates_removed = initial_rows - len(df_combined)
+
+        if duplicates_removed > 0:
+            self.logger.info(f"Removed {duplicates_removed} duplicate rows")
+
+        # Sort by startTime
+        df_combined = df_combined.sort_values('startTime').reset_index(drop=True)
+
+        self.logger.info(f"Total rows fetched: {len(df_combined)}")
+
+        return df_combined
+
+
 class DataBuilder:
     """
     Build and prepare time series data for forecasting.
@@ -235,6 +429,49 @@ class DataBuilder:
         df = df[['valueDateTimeOffset', 'settlementPeriod', 'netImbalanceVolume']]
 
         self.logger.info(f"Source 1 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+        self.logger.info(f"Date range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
+
+        return df
+
+    def load_source_2(self):
+        """
+        Load data from Elexon BMRS Demand Forecast API (Source 2).
+
+        Fetches day-ahead demand forecasts (TSDF and NDF) for the date range specified
+        in __init__ (self.start_date to self.end_date).
+
+        Returns:
+            pd.DataFrame with columns: valueDateTimeOffset, settlementPeriod, publishTime,
+                                      transmissionSystemDemand, nationalDemand
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Loading Source 2: Elexon BMRS Day-Ahead Demand Forecast (TSDF & NDF)")
+        self.logger.info("=" * 60)
+
+        # Initialize fetcher
+        fetcher = ElexonDemandForecastFetcher()
+
+        # Fetch data for date range
+        df = fetcher.fetch_date_range(self.start_date, self.end_date)
+
+        if df.empty:
+            raise ValueError("No data fetched from Elexon Demand Forecast API")
+
+        # Convert startTime to UTC datetime as valueDateTimeOffset
+        self.logger.info("Converting startTime to valueDateTimeOffset (UTC datetime)...")
+        df['valueDateTimeOffset'] = pd.to_datetime(df['startTime'], utc=True)
+
+        # Also convert publishTime to datetime for consistency
+        df['publishTime'] = pd.to_datetime(df['publishTime'], utc=True)
+
+        # Drop the original startTime column (keep valueDateTimeOffset)
+        df = df.drop(columns=['startTime'])
+
+        # Reorder columns: valueDateTimeOffset first, then features
+        df = df[['valueDateTimeOffset', 'settlementPeriod', 'publishTime',
+                'transmissionSystemDemand', 'nationalDemand']]
+
+        self.logger.info(f"Source 2 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         self.logger.info(f"Date range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
 
         return df
