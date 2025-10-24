@@ -39,7 +39,7 @@ class EnhancedTimeSeriesForecaster:
         self.n_trials = n_trials
         self.cv_folds = cv_folds
         self.use_walk_forward = use_walk_forward
-        self.lag_set = [1, 2, 4, 8, 16, 24, 48, 96, 336]
+        self.lag_set = [1, 2, 4, 8, 16, 24, 48]
         self.lag_set = [lag for lag in self.lag_set if lag <= max_lag]
 
         # Features that are pre-shifted by 2 periods in data.py
@@ -124,7 +124,7 @@ class EnhancedTimeSeriesForecaster:
 
         return fourier_features
 
-    def create_rolling_features(self, df, windows=[4, 8, 16, 24, 48, 96, 336], shifted_windows=[2, 6, 14, 22, 46, 94, 334]):
+    def create_rolling_features(self, df, windows=[4, 8, 16, 24, 48], shifted_windows=[2, 6, 14, 22, 46, 94, 334]):
         """Create rolling statistical features"""
         rolling_features = pd.DataFrame(index=df.index)
 
@@ -275,9 +275,26 @@ class EnhancedTimeSeriesForecaster:
         if not seasonal_features.empty:
             feature_df = pd.concat([feature_df, seasonal_features], axis=1)
 
+        # Remove outliers AFTER temporal features (lag, rolling, Fourier, seasonal)
+        # This preserves temporal alignment for lag/rolling window calculations
+        print("\nRemoving outliers (after temporal feature creation)...")
+        initial_rows = len(feature_df)
+        mean_val = feature_df[self.target_col].mean()
+        std_val = feature_df[self.target_col].std()
+        std_threshold = 3
+
+        outlier_mask = np.abs(feature_df[self.target_col] - mean_val) > (std_threshold * std_val)
+        outliers_removed = outlier_mask.sum()
+
+        if outliers_removed > 0:
+            print(f"Removing {outliers_removed} outliers (>{std_threshold} std from mean)")
+            feature_df = feature_df[~outlier_mask].reset_index(drop=True)
+            print(f"Rows before outlier removal: {initial_rows}")
+            print(f"Rows after outlier removal: {len(feature_df)}")
+
         # Create calendar features
-        print("Creating calendar features...")
-        calendar_features = self.create_calendar_features(df)
+        print("\nCreating calendar features...")
+        calendar_features = self.create_calendar_features(feature_df)
         feature_df = pd.concat([feature_df, calendar_features], axis=1)
 
         # Create interaction features
@@ -887,7 +904,6 @@ def main():
     # Load and process data
     df = forecaster.load_data(args.csv_path)
     df = forecaster.regularize_frequency(df)
-    df = forecaster.remove_outliers(df)
 
     # Feature engineering
     feature_df = forecaster.feature_engineering(df)
