@@ -22,10 +22,8 @@ from sklearn.ensemble import VotingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 import lightgbm as lgb
-import xgboost as xgb
+# import xgboost as xgb  # Disabled: slow training, similar performance to Lasso/LightGBM
 import optuna
-from statsmodels.tsa.seasonal import seasonal_decompose
-from statsmodels.tsa.stattools import adfuller
 
 # Visualization
 import matplotlib.pyplot as plt
@@ -41,8 +39,16 @@ class EnhancedTimeSeriesForecaster:
         self.n_trials = n_trials
         self.cv_folds = cv_folds
         self.use_walk_forward = use_walk_forward
-        self.lag_set = [1, 2, 3, 6, 12, 24, 48, 96]
+        self.lag_set = [1, 2, 4, 8, 16, 24, 48, 96, 336]
         self.lag_set = [lag for lag in self.lag_set if lag <= max_lag]
+
+        # Features that are pre-shifted by 2 periods in data.py
+        # These features need adjusted lags/windows to avoid redundancy
+        self.shifted_features = ['indo', 'indo_ndf', 'modelError', 'itsdo', 'itsdo_tsdf', 'HH_NET_SUM']
+        self.shifted_lag_set = [1, 2, 6, 14, 22, 46, 94, 334]  # Adjusted lags (subtract 2 from standard)
+        self.shifted_lag_set = [lag for lag in self.shifted_lag_set if lag <= max_lag]
+        self.shifted_windows = [2, 6, 14, 22, 46, 94, 334]  # Adjusted rolling windows
+
         self.feature_columns = []
         self.feature_names = []  # Store actual feature names used during training
         self.target_col = 'premium'
@@ -53,6 +59,7 @@ class EnhancedTimeSeriesForecaster:
         self.best_model_name = None
         self.ensemble_model = None
         self.residuals = None  # For prediction intervals
+        self.best_params = {}  # Store best hyperparameters for walk-forward retraining
 
     def load_data(self, csv_path):
         """Load and initial processing of data"""
@@ -65,14 +72,10 @@ class EnhancedTimeSeriesForecaster:
         # Sort by time
         df = df.sort_values(self.timestamp_col).reset_index(drop=True)
 
-        # Drop missing timestamp or target
-        initial_rows = len(df)
-        df = df.dropna(subset=[self.timestamp_col, self.target_col])
-        print(f"Dropped {initial_rows - len(df)} rows with missing timestamp/target")
-
         # Drop duplicate timestamps (keep last)
         df = df.drop_duplicates(subset=[self.timestamp_col], keep='last')
-        print(f"Final dataset shape: {df.shape}")
+        print(f"Final dataset shape after deduplication: {df.shape}")
+        print(f"NOTE: NaN rows will be removed AFTER feature engineering to preserve temporal alignment")
 
         return df
 
@@ -107,7 +110,7 @@ class EnhancedTimeSeriesForecaster:
 
         return df
 
-    def create_fourier_features(self, df, periods=[24, 168, 8760]):  # hourly, weekly, yearly
+    def create_fourier_features(self, df, periods=[4, 8, 12, 24, 48, 168]):  # 4h, 8h, 12h, daily, 2-day, weekly
         """Create Fourier features for periodic patterns"""
         fourier_features = pd.DataFrame(index=df.index)
 
@@ -121,12 +124,25 @@ class EnhancedTimeSeriesForecaster:
 
         return fourier_features
 
-    def create_rolling_features(self, df, windows=[6, 12, 24, 48]):
+    def create_rolling_features(self, df, windows=[4, 8, 16, 24, 48, 96, 336], shifted_windows=[2, 6, 14, 22, 46, 94, 334]):
         """Create rolling statistical features"""
         rolling_features = pd.DataFrame(index=df.index)
 
-        for col in [self.target_col] + self.feature_columns:
-            for window in windows:
+        # Only create rolling features for numeric columns (EXCLUDING target to prevent leakage)
+        numeric_cols = [col for col in self.feature_columns
+                       if pd.api.types.is_numeric_dtype(df[col])]
+
+        for col in numeric_cols:
+            # Check if this is a shift(2) feature from data.py
+            if col in self.shifted_features:
+                # Use adjusted windows for features already shifted by 2 periods
+                window_set = shifted_windows
+                print(f"Creating adjusted rolling windows for shift(2) feature: {col}")
+            else:
+                # Use standard windows for normal features
+                window_set = windows
+
+            for window in window_set:
                 if window <= len(df):
                     # Fix data leakage: use min_periods=window to ensure full window
                     rolling_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window, min_periods=window).mean()
@@ -138,57 +154,80 @@ class EnhancedTimeSeriesForecaster:
 
     def create_seasonal_features(self, df):
         """Create seasonal decomposition features"""
+        # DISABLED: Seasonal decomposition of target causes data leakage
+        # The decomposition uses the entire time series including future values
+        # which would not be available at prediction time
         seasonal_features = pd.DataFrame(index=df.index)
-
-        # Only if we have enough data points
-        if len(df) >= 48:  # At least 2 days for hourly data
-            try:
-                # Use a reasonable period for decomposition
-                period = min(24, len(df) // 4)  # Daily cycle or quarter of data
-                decomposition = seasonal_decompose(df[self.target_col].ffill(),
-                                                 model='additive', period=period, extrapolate_trend='freq')
-
-                seasonal_features[f'{self.target_col}_trend'] = decomposition.trend
-                seasonal_features[f'{self.target_col}_seasonal'] = decomposition.seasonal
-                seasonal_features[f'{self.target_col}_residual'] = decomposition.resid
-            except:
-                print("Warning: Could not create seasonal decomposition features")
-
+        print("Skipping seasonal decomposition features to prevent target leakage")
         return seasonal_features
 
     def create_lag_features(self, df):
         """Create lag features for target and regressors"""
         feature_df = df[[self.timestamp_col, self.target_col] + self.feature_columns].copy()
 
-        # Standard lag features
-        for lag in self.lag_set:
-            # Target lags
-            feature_df[f'{self.target_col}_lag_{lag}'] = feature_df[self.target_col].shift(lag)
+        # Only create lag features for numeric columns
+        numeric_feature_cols = [col for col in self.feature_columns
+                               if pd.api.types.is_numeric_dtype(df[col])]
 
-            # Regressor lags
-            for col in self.feature_columns:
+        # Create lag features with appropriate lag set based on feature type
+        for col in numeric_feature_cols:
+            # Check if this is a shift(2) feature from data.py
+            if col in self.shifted_features:
+                # Use adjusted lag set for features already shifted by 2 periods
+                lag_set = self.shifted_lag_set
+                print(f"Creating adjusted lags for shift(2) feature: {col}")
+            else:
+                # Use standard lag set for normal features
+                lag_set = self.lag_set
+
+            # Create lag features
+            for lag in lag_set:
                 feature_df[f'{col}_lag_{lag}'] = feature_df[col].shift(lag)
 
         return feature_df
 
-    def create_interaction_features(self, df, max_interactions=10):
-        """Create cross-lag interaction features"""
+    def create_interaction_features(self, df, max_interactions=20):
+        """Create interaction features between important features (excluding premium/target)"""
         interaction_features = pd.DataFrame(index=df.index)
 
-        # Get lag columns
-        target_lags = [col for col in df.columns if col.startswith(f'{self.target_col}_lag_')]
-        regressor_lags = [col for col in df.columns if '_lag_' in col and not col.startswith(f'{self.target_col}_lag_')]
+        # Get ALL numeric feature columns (excluding target/premium and timestamp)
+        # This includes: original features, lag features, rolling features, calendar features, etc.
+        all_feature_cols = [col for col in df.columns
+                           if col not in [self.timestamp_col, self.target_col]
+                           and not col.startswith(f'{self.target_col}_')  # Exclude any premium-derived columns
+                           and pd.api.types.is_numeric_dtype(df[col])]
 
-        # Create interactions between target lags and regressor lags
-        interaction_count = 0
-        for target_lag in target_lags[:5]:  # Limit to first 5 target lags
-            for reg_lag in regressor_lags:
+        print(f"Found {len(all_feature_cols)} numeric features for potential interactions")
+
+        # Create interactions between top features (by variance)
+        if len(all_feature_cols) >= 2:
+            # Calculate variance for each feature to identify most informative ones
+            feature_vars = []
+            for col in all_feature_cols:
+                var = df[col].var()
+                if not pd.isna(var) and var > 0:  # Exclude constant or NaN features
+                    feature_vars.append((col, var))
+
+            # Sort by variance (higher variance = potentially more informative)
+            feature_vars.sort(key=lambda x: x[1], reverse=True)
+            top_features = [col for col, _ in feature_vars[:15]]  # Top 15 features by variance
+
+            print(f"Creating interactions from top {len(top_features)} features by variance")
+
+            # Create pairwise interactions
+            interaction_count = 0
+            for i, feat1 in enumerate(top_features):
+                for feat2 in top_features[i+1:]:  # Avoid duplicate pairs and self-interaction
+                    if interaction_count >= max_interactions:
+                        break
+                    interaction_features[f'{feat1}_x_{feat2}'] = df[feat1] * df[feat2]
+                    interaction_count += 1
                 if interaction_count >= max_interactions:
                     break
-                interaction_features[f'{target_lag}_x_{reg_lag}'] = df[target_lag] * df[reg_lag]
-                interaction_count += 1
-            if interaction_count >= max_interactions:
-                break
+
+            print(f"Created {interaction_count} feature interactions (premium completely excluded)")
+        else:
+            print("Not enough features to create interactions")
 
         return interaction_features
 
@@ -247,12 +286,37 @@ class EnhancedTimeSeriesForecaster:
         if not interaction_features.empty:
             feature_df = pd.concat([feature_df, interaction_features], axis=1)
 
-        # Drop rows with NaNs caused by shifting
-        initial_rows = len(feature_df)
-        feature_df = feature_df.dropna()
-        print(f"Dropped {initial_rows - len(feature_df)} rows due to NaN values from feature creation")
+        # Drop rows with NaNs caused by lag/rolling features
+        print("=" * 60)
+        print("Removing NaN Rows (Post Feature Engineering)")
+        print("=" * 60)
 
-        print(f"Final feature matrix shape: {feature_df.shape}")
+        initial_rows = len(feature_df)
+
+        # Analyze NaN distribution before dropping
+        nan_counts = feature_df.isnull().sum()
+        nan_counts = nan_counts[nan_counts > 0].sort_values(ascending=False)
+
+        if len(nan_counts) > 0:
+            print(f"\nNaN counts by column (before removal):")
+            # Show top 10 columns with most NaNs
+            for col, count in nan_counts.head(10).items():
+                print(f"  {col}: {count} NaNs ({count/initial_rows*100:.2f}%)")
+            if len(nan_counts) > 10:
+                print(f"  ... and {len(nan_counts) - 10} more columns with NaNs")
+        else:
+            print("\nNo NaN values found in any column")
+
+        # Drop rows with NaNs
+        feature_df = feature_df.dropna()
+
+        removed_rows = initial_rows - len(feature_df)
+        print(f"\nRows before: {initial_rows}")
+        print(f"Rows after: {len(feature_df)}")
+        print(f"Rows removed: {removed_rows}")
+        print(f"Final shape: {feature_df.shape}")
+        print("=" * 60)
+
         return feature_df
 
     def expanding_window_split(self, df, min_train_size=0.6):
@@ -286,7 +350,7 @@ class EnhancedTimeSeriesForecaster:
 
             elif model_type == 'lasso':
                 alpha = trial.suggest_float('alpha', 0.01, 100.0, log=True)
-                model = Lasso(alpha=alpha, random_state=42, max_iter=2000)
+                model = Lasso(alpha=alpha, random_state=42, max_iter=500)
 
             elif model_type == 'lightgbm':
                 params = {
@@ -301,18 +365,18 @@ class EnhancedTimeSeriesForecaster:
                 }
                 model = lgb.LGBMRegressor(**params, random_state=42, verbose=-1)
 
-            elif model_type == 'xgboost':
-                params = {
-                    'n_estimators': 1000,  # Use early stopping
-                    'max_depth': trial.suggest_int('max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                    'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                    'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
-                    'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
-                    'early_stopping_rounds': 50,
-                }
-                model = xgb.XGBRegressor(**params, random_state=42, verbose=0)
+            # elif model_type == 'xgboost':  # Disabled: slow training, similar performance
+            #     params = {
+            #         'n_estimators': 1000,  # Use early stopping
+            #         'max_depth': trial.suggest_int('max_depth', 3, 10),
+            #         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            #         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            #         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            #         'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+            #         'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+            #         'early_stopping_rounds': 50,
+            #     }
+            #     model = xgb.XGBRegressor(**params, random_state=42, verbose=0)
 
             # Cross-validation with expanding windows
             splits = self.expanding_window_split(pd.DataFrame(X_train))
@@ -336,15 +400,14 @@ class EnhancedTimeSeriesForecaster:
                     X_val_processed = temp_imputer.transform(X_val)
 
                 # Fit with early stopping for gradient boosting models
-                if model_type in ['lightgbm', 'xgboost']:
-                    if model_type == 'lightgbm':
-                        model.fit(X_tr_processed, y_tr,
-                                eval_set=[(X_val_processed, y_val)],
-                                callbacks=[lgb.early_stopping(50, verbose=False)])
-                    elif model_type == 'xgboost':
-                        model.fit(X_tr_processed, y_tr,
-                                eval_set=[(X_val_processed, y_val)],
-                                verbose=False)
+                if model_type == 'lightgbm':
+                    model.fit(X_tr_processed, y_tr,
+                            eval_set=[(X_val_processed, y_val)],
+                            callbacks=[lgb.early_stopping(50, verbose=False)])
+                # elif model_type == 'xgboost':  # Disabled
+                #     model.fit(X_tr_processed, y_tr,
+                #             eval_set=[(X_val_processed, y_val)],
+                #             verbose=False)
                 else:
                     model.fit(X_tr_processed, y_tr)
 
@@ -354,9 +417,23 @@ class EnhancedTimeSeriesForecaster:
 
             return np.mean(scores)
 
-        # Run optimization with reduced trials for faster execution
+        # Run optimization with model-specific trials
+        if model_type == 'lasso':
+            n_trials = 10  # Lasso only has 1 hyperparameter, 10 trials is sufficient
+        else:
+            n_trials = min(self.n_trials, 50)  # Keep 50 for other models
+
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=min(self.n_trials, 50))  # Limit trials
+
+        # Parallelize Optuna trials to utilize multiple CPU cores
+        if model_type == 'lightgbm':
+            # LightGBM already uses all cores internally, limit parallel trials
+            n_jobs = 4
+        else:
+            # Ridge/Lasso are single-threaded, can run many trials in parallel
+            n_jobs = 8
+
+        study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
 
         return study.best_params
 
@@ -371,7 +448,7 @@ class EnhancedTimeSeriesForecaster:
             'ridge': Ridge,
             'lasso': Lasso,
             'lightgbm': lgb.LGBMRegressor,
-            'xgboost': xgb.XGBRegressor
+            # 'xgboost': xgb.XGBRegressor  # Disabled: slow training, similar performance
         }
 
         for model_name, model_class in model_configs.items():
@@ -380,6 +457,9 @@ class EnhancedTimeSeriesForecaster:
             # Optimize hyperparameters
             best_params = self.optimize_hyperparameters(X_train, y_train, model_name)
             print(f"Best parameters for {model_name}: {best_params}")
+
+            # Store best hyperparameters for walk-forward retraining
+            self.best_params[model_name] = best_params
 
             # Prepare data based on model type
             if model_name in ['ridge', 'lasso']:
@@ -395,7 +475,7 @@ class EnhancedTimeSeriesForecaster:
                 if model_name == 'ridge':
                     model = Ridge(**best_params, random_state=42)
                 else:  # lasso
-                    model = Lasso(**best_params, random_state=42, max_iter=2000)
+                    model = Lasso(**best_params, random_state=42, max_iter=500)
 
             else:
                 # Tree-based models only need imputation
@@ -406,24 +486,23 @@ class EnhancedTimeSeriesForecaster:
 
                 if model_name == 'lightgbm':
                     model = lgb.LGBMRegressor(**best_params, random_state=42, verbose=-1)
-                elif model_name == 'xgboost':
-                    model = xgb.XGBRegressor(**best_params, random_state=42, verbose=0)
+                # elif model_name == 'xgboost':  # Disabled
+                #     model = xgb.XGBRegressor(**best_params, random_state=42, verbose=0)
 
             # Train the model (with early stopping for tree models)
-            if model_name in ['lightgbm', 'xgboost']:
+            if model_name == 'lightgbm':
                 # Create a validation split for early stopping
                 val_size = int(len(X_train) * 0.2)
                 X_tr, X_val = X_processed[:-val_size], X_processed[-val_size:]
                 y_tr, y_val = y_train.iloc[:-val_size], y_train.iloc[-val_size:]
 
-                if model_name == 'lightgbm':
-                    model.fit(X_tr, y_tr,
-                            eval_set=[(X_val, y_val)],
-                            callbacks=[lgb.early_stopping(50, verbose=False)])
-                elif model_name == 'xgboost':
-                    model.fit(X_tr, y_tr,
-                            eval_set=[(X_val, y_val)],
-                            verbose=False)
+                model.fit(X_tr, y_tr,
+                        eval_set=[(X_val, y_val)],
+                        callbacks=[lgb.early_stopping(50, verbose=False)])
+                # elif model_name == 'xgboost':  # Disabled
+                #     model.fit(X_tr, y_tr,
+                #             eval_set=[(X_val, y_val)],
+                #             verbose=False)
             else:
                 model.fit(X_processed, y_train)
 
@@ -445,14 +524,15 @@ class EnhancedTimeSeriesForecaster:
         print("Ensemble model created using weighted average")
 
     def walk_forward_validation(self, X, y, n_splits=5):
-        """Perform walk-forward validation"""
-        print(f"\nPerforming walk-forward validation with {n_splits} splits...")
+        """Perform TRUE walk-forward validation with retraining at each split"""
+        print(f"\nPerforming TRUE walk-forward validation with {n_splits} splits...")
+        print("NOTE: Models will be retrained at each split (no data leakage)")
 
         n = len(X)
         min_train = int(n * 0.6)  # Minimum 60% for initial training
         step_size = (n - min_train) // n_splits
 
-        results = {model_name: [] for model_name in self.models.keys()}
+        results = {model_name: [] for model_name in self.best_params.keys()}
         results['ensemble'] = []
 
         for i in range(n_splits):
@@ -463,48 +543,95 @@ class EnhancedTimeSeriesForecaster:
             if test_end <= test_start:
                 break
 
-            print(f"  Split {i+1}/{n_splits}: Train[0:{train_end}], Test[{test_start}:{test_end}]")
+            print(f"\n  Split {i+1}/{n_splits}: Train[0:{train_end}], Test[{test_start}:{test_end}]")
 
             X_train_wf = X.iloc[:train_end]
             y_train_wf = y.iloc[:train_end]
             X_test_wf = X.iloc[test_start:test_end]
             y_test_wf = y.iloc[test_start:test_end]
 
-            # Evaluate each model
-            for model_name, model in self.models.items():
-                if model_name in ['ridge', 'lasso']:
-                    X_processed = self.scalers[model_name].transform(
-                        self.imputers[model_name].transform(X_test_wf)
-                    )
-                else:
-                    X_processed = self.imputers[model_name].transform(X_test_wf)
+            # Store predictions for ensemble
+            split_predictions = {}
 
-                y_pred = model.predict(X_processed)
+            # Retrain and evaluate each model with best hyperparameters
+            for model_name in self.best_params.keys():
+                print(f"    Retraining {model_name}...")
+                best_params = self.best_params[model_name]
+
+                # Create and preprocess based on model type
+                if model_name == 'ridge':
+                    # Ridge: impute + scale
+                    imputer_wf = SimpleImputer(strategy='median')
+                    scaler_wf = StandardScaler()
+
+                    X_train_processed = scaler_wf.fit_transform(
+                        imputer_wf.fit_transform(X_train_wf)
+                    )
+                    X_test_processed = scaler_wf.transform(
+                        imputer_wf.transform(X_test_wf)
+                    )
+
+                    model = Ridge(**best_params, random_state=42)
+                    model.fit(X_train_processed, y_train_wf)
+
+                elif model_name == 'lasso':
+                    # Lasso: impute + scale
+                    imputer_wf = SimpleImputer(strategy='median')
+                    scaler_wf = StandardScaler()
+
+                    X_train_processed = scaler_wf.fit_transform(
+                        imputer_wf.fit_transform(X_train_wf)
+                    )
+                    X_test_processed = scaler_wf.transform(
+                        imputer_wf.transform(X_test_wf)
+                    )
+
+                    model = Lasso(**best_params, random_state=42, max_iter=500)
+                    model.fit(X_train_processed, y_train_wf)
+
+                elif model_name == 'lightgbm':
+                    # LightGBM: impute only
+                    imputer_wf = SimpleImputer(strategy='median')
+
+                    X_train_processed = imputer_wf.fit_transform(X_train_wf)
+                    X_test_processed = imputer_wf.transform(X_test_wf)
+
+                    # Use early stopping with validation split
+                    val_size = int(len(X_train_processed) * 0.2)
+                    X_tr, X_val = X_train_processed[:-val_size], X_train_processed[-val_size:]
+                    y_tr, y_val = y_train_wf.iloc[:-val_size], y_train_wf.iloc[-val_size:]
+
+                    model = lgb.LGBMRegressor(**best_params, random_state=42, verbose=-1)
+                    model.fit(X_tr, y_tr,
+                            eval_set=[(X_val, y_val)],
+                            callbacks=[lgb.early_stopping(50, verbose=False)])
+
+                # Make predictions
+                y_pred = model.predict(X_test_processed)
                 mae = mean_absolute_error(y_test_wf, y_pred)
                 results[model_name].append(mae)
+                split_predictions[model_name] = y_pred
 
-            # Ensemble
-            ensemble_pred = np.zeros(len(y_test_wf))
-            for model_name in self.models.keys():
-                if model_name in ['ridge', 'lasso']:
-                    X_processed = self.scalers[model_name].transform(
-                        self.imputers[model_name].transform(X_test_wf)
-                    )
-                else:
-                    X_processed = self.imputers[model_name].transform(X_test_wf)
-                ensemble_pred += self.models[model_name].predict(X_processed)
-            ensemble_pred /= len(self.models)
+                print(f"      {model_name} MAE: {mae:.4f}")
 
+            # Calculate ensemble prediction (simple average)
+            ensemble_pred = np.mean([split_predictions[m] for m in split_predictions.keys()], axis=0)
             mae_ensemble = mean_absolute_error(y_test_wf, ensemble_pred)
             results['ensemble'].append(mae_ensemble)
+            print(f"      ensemble MAE: {mae_ensemble:.4f}")
 
-        # Average results
+        # Calculate average results
+        print("\n" + "="*60)
+        print("Walk-Forward Validation Results (with retraining):")
+        print("="*60)
+
         avg_results = {}
         for model_name, scores in results.items():
-            avg_mae = np.mean(scores)
-            std_mae = np.std(scores)
-            avg_results[model_name] = {'mae': avg_mae, 'mae_std': std_mae}
-            print(f"  {model_name:10s} | MAE: {avg_mae:.4f} ± {std_mae:.4f}")
+            if len(scores) > 0:
+                avg_mae = np.mean(scores)
+                std_mae = np.std(scores)
+                avg_results[model_name] = {'mae': avg_mae, 'mae_std': std_mae}
+                print(f"{model_name:10s} | MAE: {avg_mae:.4f} ± {std_mae:.4f}")
 
         # Select best model
         best_model = min(avg_results.keys(), key=lambda x: avg_results[x]['mae'])
@@ -630,7 +757,7 @@ class EnhancedTimeSeriesForecaster:
         if self.best_model_name == 'ensemble':
             # Average importance across all tree models
             for model_name, model in self.models.items():
-                if model_name in ['lightgbm', 'xgboost']:
+                if model_name == 'lightgbm':  # Only lightgbm now (xgboost disabled)
                     if hasattr(model, 'feature_importances_'):
                         feature_importance[model_name] = model.feature_importances_
         else:
@@ -743,6 +870,8 @@ def main():
     parser.add_argument('--chart-path', type=str, default='forecast_chart.png', help='Path to save chart')
     parser.add_argument('--importance-path', type=str, default='feature_importance.csv', help='Path to save feature importance')
     parser.add_argument('--walk-forward', action='store_true', help='Use walk-forward validation instead of single train/test split')
+    parser.add_argument('--train-end-date', type=str, help='End date for training (format: YYYY-MM-DD). If provided, uses custom date-based split.')
+    parser.add_argument('--test-start-date', type=str, help='Start date for testing (format: YYYY-MM-DD). If provided, uses custom date-based split.')
 
     args = parser.parse_args()
 
@@ -764,26 +893,74 @@ def main():
     feature_df = forecaster.feature_engineering(df)
 
     # Prepare features and target
+    # Filter out non-numeric columns (except timestamp and target)
     feature_cols = [col for col in feature_df.columns
-                   if col not in [forecaster.timestamp_col, forecaster.target_col]]
+                   if col not in [forecaster.timestamp_col, forecaster.target_col]
+                   and pd.api.types.is_numeric_dtype(feature_df[col])]
+
+    print(f"Selected {len(feature_cols)} numeric feature columns for modeling")
 
     X = feature_df[feature_cols]
     y = feature_df[forecaster.target_col]
     timestamps = feature_df[forecaster.timestamp_col]
 
-    # Time-based split (80/20) with proper temporal separation
-    # Add max_lag buffer to prevent data leakage from training into test
-    split_idx = int(len(X) * 0.8)
-    X_train = X.iloc[:split_idx]
-    y_train = y.iloc[:split_idx]
+    # Time-based split - use custom dates if provided, otherwise default 80/20
+    if args.train_end_date or args.test_start_date:
+        # Custom date-based split
+        print("Using custom date-based train/test split...")
 
-    # Start test set after max_lag to prevent leakage from lag features
-    test_start_idx = min(split_idx + forecaster.max_lag, len(X))
-    X_test = X.iloc[test_start_idx:]
-    y_test = y.iloc[test_start_idx:]
-    timestamps_test = timestamps.iloc[test_start_idx:]
+        if not args.train_end_date or not args.test_start_date:
+            raise ValueError("Both --train-end-date and --test-start-date must be provided for custom split")
 
-    print(f"Train size: {len(X_train)}, Test size: {len(X_test)} (with {forecaster.max_lag}-step buffer)")
+        # Parse dates (assume end of day for train_end_date, start of day for test_start_date)
+        train_end = pd.to_datetime(args.train_end_date, utc=True) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        test_start = pd.to_datetime(args.test_start_date, utc=True)
+
+        print(f"Train end date: {train_end}")
+        print(f"Test start date: {test_start}")
+
+        # Find split indices based on timestamps
+        train_mask = timestamps <= train_end
+        test_mask = timestamps >= test_start
+
+        if train_mask.sum() == 0:
+            raise ValueError(f"No training data found before {train_end}")
+        if test_mask.sum() == 0:
+            raise ValueError(f"No test data found after {test_start}")
+
+        # Get indices
+        train_indices = timestamps[train_mask].index
+        test_indices = timestamps[test_mask].index
+
+        X_train = X.loc[train_indices]
+        y_train = y.loc[train_indices]
+        X_test = X.loc[test_indices]
+        y_test = y.loc[test_indices]
+        timestamps_test = timestamps.loc[test_indices]
+
+        print(f"Train size: {len(X_train)} (ends {timestamps.loc[train_indices[-1]]})")
+        print(f"Test size: {len(X_test)} (starts {timestamps.loc[test_indices[0]]})")
+
+        # Calculate gap between train and test
+        gap_days = (timestamps.loc[test_indices[0]] - timestamps.loc[train_indices[-1]]).days
+        print(f"Gap between train and test: {gap_days} days")
+
+    else:
+        # Default percentage-based split (80/20) with proper temporal separation
+        print("Using default 80/20 train/test split...")
+
+        # Add max_lag buffer to prevent data leakage from training into test
+        split_idx = int(len(X) * 0.8)
+        X_train = X.iloc[:split_idx]
+        y_train = y.iloc[:split_idx]
+
+        # Start test set after max_lag to prevent leakage from lag features
+        test_start_idx = min(split_idx + forecaster.max_lag, len(X))
+        X_test = X.iloc[test_start_idx:]
+        y_test = y.iloc[test_start_idx:]
+        timestamps_test = timestamps.iloc[test_start_idx:]
+
+        print(f"Train size: {len(X_train)}, Test size: {len(X_test)} (with {forecaster.max_lag}-step buffer)")
 
     # Train models
     forecaster.train_models(X_train, y_train)

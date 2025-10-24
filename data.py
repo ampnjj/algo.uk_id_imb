@@ -14,6 +14,7 @@ from pathlib import Path
 import requests
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -272,8 +273,12 @@ class ElexonDemandForecastFetcher:
                     self.logger.warning(f"Missing columns {missing_cols} for {start_time} (publishTime=-{hours_before}h)")
                     return pd.DataFrame()
 
-                # Select required columns
+                # Select required columns and rename to match expected names
                 df_result = df_filtered[required_cols].copy()
+                df_result = df_result.rename(columns={
+                    'transmissionSystemDemand': 'tsdf',
+                    'nationalDemand': 'ndf'
+                })
 
                 # Take the first row if there are multiple matches (should be only one)
                 if len(df_result) > 1:
@@ -301,14 +306,14 @@ class ElexonDemandForecastFetcher:
         """
         Fetch demand forecast for a specific settlement period.
 
-        Tries publishTime = startTime - 1 hour first, falls back to -2 hours if no data found.
+        Tries publishTime = startTime - 1 hour first, falls back to -2, -3, -4 hours if no data found.
 
         Args:
             start_time: datetime object for the settlement period start time (UTC)
 
         Returns:
             pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
-                                      transmissionSystemDemand, nationalDemand
+                                      tsdf, ndf
         """
         self.logger.info(f"Fetching demand forecast for startTime {start_time.strftime('%Y-%m-%d %H:%M')} "
                         f"(publishTime={start_time - timedelta(hours=1):%Y-%m-%dT%H:%M})")
@@ -320,6 +325,20 @@ class ElexonDemandForecastFetcher:
             # Fallback: try 2 hours before startTime
             self.logger.info(f"No data found with publishTime=-1h, trying -2h for {start_time.strftime('%Y-%m-%d %H:%M')}")
             df = self._fetch_with_publish_time(start_time, hours_before=2)
+
+        if df.empty:
+            # Fallback: try 3 hours before startTime
+            self.logger.info(f"No data found with publishTime=-2h, trying -3h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=3)
+
+        if df.empty:
+            # Fallback: try 4 hours before startTime
+            self.logger.info(f"No data found with publishTime=-3h, trying -4h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=4)
+
+        if df.empty:
+            # Log error if all fallback attempts failed
+            self.logger.error(f"No data found for {start_time.strftime('%Y-%m-%d %H:%M')} after trying publishTime -1h, -2h, -3h, and -4h")
 
         return df
 
@@ -333,7 +352,7 @@ class ElexonDemandForecastFetcher:
 
         Returns:
             pd.DataFrame with columns: startTime, settlementPeriod, publishTime,
-                                      transmissionSystemDemand, nationalDemand
+                                      tsdf, ndf
         """
         # Convert strings to datetime.date if needed
         if isinstance(start_date, str):
@@ -378,7 +397,7 @@ class ElexonDemandForecastFetcher:
         if not all_dfs:
             self.logger.warning("No data fetched for any settlement period")
             return pd.DataFrame(columns=['startTime', 'settlementPeriod', 'publishTime',
-                                        'transmissionSystemDemand', 'nationalDemand'])
+                                        'tsdf', 'ndf'])
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
 
@@ -429,7 +448,7 @@ class ElexonDemandOutturnFetcher:
 
         Returns:
             pd.DataFrame with columns: startTime, settlementPeriod,
-                                      initialDemandOutturn, initialTransmissionSystemDemandOutturn
+                                      indo, itsdo
         """
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
@@ -477,16 +496,20 @@ class ElexonDemandOutturnFetcher:
                 df = pd.DataFrame(records)
 
                 # Check required columns exist
-                required_cols = ['startTime', 'settlementPeriod', 'initialDemandOutturn',
-                               'initialTransmissionSystemDemandOutturn']
+                required_cols = ['startTime', 'settlementPeriod',
+                               'initialDemandOutturn', 'initialTransmissionSystemDemandOutturn']
                 missing_cols = [col for col in required_cols if col not in df.columns]
 
                 if missing_cols:
                     self.logger.warning(f"Missing columns {missing_cols} for {start_date_str} to {end_date_str}")
                     return pd.DataFrame()
 
-                # Select required columns
+                # Select required columns and rename to match expected names
                 df_result = df[required_cols].copy()
+                df_result = df_result.rename(columns={
+                    'initialDemandOutturn': 'indo',
+                    'initialTransmissionSystemDemandOutturn': 'itsdo'
+                })
 
                 self.logger.info(f"Successfully fetched {len(df_result)} rows for {start_date_str} to {end_date_str}")
                 return df_result
@@ -517,7 +540,7 @@ class ElexonDemandOutturnFetcher:
 
         Returns:
             pd.DataFrame with columns: startTime, settlementPeriod,
-                                      initialDemandOutturn, initialTransmissionSystemDemandOutturn
+                                      indo, itsdo
         """
         # Convert strings to datetime.date if needed
         if isinstance(start_date, str):
@@ -554,7 +577,7 @@ class ElexonDemandOutturnFetcher:
         if not all_dfs:
             self.logger.warning("No data fetched for any batch")
             return pd.DataFrame(columns=['startTime', 'settlementPeriod',
-                                        'initialDemandOutturn', 'initialTransmissionSystemDemandOutturn'])
+                                        'indo', 'itsdo'])
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
 
@@ -694,7 +717,7 @@ class ElexonIndicatedImbalanceFetcher:
         """
         Fetch indicated imbalance forecast for a specific settlement period.
 
-        Tries publishTime = startTime - 1 hour first, falls back to -2 hours if no data found.
+        Tries publishTime = startTime - 1 hour first, falls back to -2, -3, -4 hours if no data found.
 
         Args:
             start_time: datetime object for the settlement period start time (UTC)
@@ -713,6 +736,20 @@ class ElexonIndicatedImbalanceFetcher:
             # Fallback: try 2 hours before startTime
             self.logger.info(f"No data found with publishTime=-1h, trying -2h for {start_time.strftime('%Y-%m-%d %H:%M')}")
             df = self._fetch_with_publish_time(start_time, hours_before=2)
+
+        if df.empty:
+            # Fallback: try 3 hours before startTime
+            self.logger.info(f"No data found with publishTime=-2h, trying -3h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=3)
+
+        if df.empty:
+            # Fallback: try 4 hours before startTime
+            self.logger.info(f"No data found with publishTime=-3h, trying -4h for {start_time.strftime('%Y-%m-%d %H:%M')}")
+            df = self._fetch_with_publish_time(start_time, hours_before=4)
+
+        if df.empty:
+            # Log error if all fallback attempts failed
+            self.logger.error(f"No data found for {start_time.strftime('%Y-%m-%d %H:%M')} after trying publishTime -1h, -2h, -3h, and -4h")
 
         return df
 
@@ -1431,6 +1468,10 @@ class DataBuilder:
         # Drop the original startTime column (keep valueDateTimeOffset)
         df = df.drop(columns=['startTime'])
 
+        # Convert MWh to MW for half-hourly data (multiply by 2)
+        self.logger.info("Converting netImbalanceVolume from MWh to MW (× 2 for half-hourly data)...")
+        df['netImbalanceVolume'] = df['netImbalanceVolume'] * 2
+
         # Reorder columns: valueDateTimeOffset first, then features
         df = df[['valueDateTimeOffset', 'settlementDate', 'settlementPeriod', 'netImbalanceVolume']]
 
@@ -1448,7 +1489,7 @@ class DataBuilder:
 
         Returns:
             pd.DataFrame with columns: valueDateTimeOffset, settlementPeriod, publishTime,
-                                      transmissionSystemDemand, nationalDemand
+                                      tsdf, ndf
         """
         self.logger.info("=" * 60)
         self.logger.info("Loading Source 2: Elexon BMRS Day-Ahead Demand Forecast (TSDF & NDF)")
@@ -1475,7 +1516,7 @@ class DataBuilder:
 
         # Reorder columns: valueDateTimeOffset first, then features
         df = df[['valueDateTimeOffset', 'settlementPeriod', 'publishTime',
-                'transmissionSystemDemand', 'nationalDemand']]
+                'tsdf', 'ndf']]
 
         self.logger.info(f"Source 2 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         self.logger.info(f"Date range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
@@ -1491,7 +1532,7 @@ class DataBuilder:
 
         Returns:
             pd.DataFrame with columns: valueDateTimeOffset, settlementPeriod,
-                                      initialDemandOutturn, initialTransmissionSystemDemandOutturn
+                                      indo, itsdo
         """
         self.logger.info("=" * 60)
         self.logger.info("Loading Source 3: Elexon BMRS Demand Outturn (Actual Demand)")
@@ -1516,7 +1557,7 @@ class DataBuilder:
 
         # Reorder columns: valueDateTimeOffset first, then features
         df = df[['valueDateTimeOffset', 'settlementPeriod',
-                'initialDemandOutturn', 'initialTransmissionSystemDemandOutturn']]
+                'indo', 'itsdo']]
 
         self.logger.info(f"Source 3 loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         self.logger.info(f"Date range: {df['valueDateTimeOffset'].min()} to {df['valueDateTimeOffset'].max()}")
@@ -1828,16 +1869,15 @@ class DataBuilder:
         else:
             raise ValueError("DataFrame must have either 'valueDateTimeOffset' or 'settlementDate'+'settlementPeriod'")
 
-        # Remove rows with missing timestamps
+        # Remove rows with missing timestamps only
         drop_cols = []
         if timestamp_col:
             drop_cols.append(timestamp_col)
         else:
             drop_cols.extend(['settlementDate', 'settlementPeriod'])
 
-        if require_premium and 'premium' in df.columns:
-            drop_cols.append('premium')
-
+        # Note: We do NOT drop rows with missing premium here because it would break lag alignment
+        # Premium NaN handling is done after feature engineering in remove_nans()
         df = df.dropna(subset=drop_cols)
 
         # Remove duplicate timestamps (keep last)
@@ -1853,7 +1893,187 @@ class DataBuilder:
         if removed_rows > 0:
             self.logger.info(f"  - Removed {removed_rows} rows during cleaning")
 
+        # Apply forward fill (limit 2) to key columns to reduce NaNs before feature engineering
+        # This preserves lag alignment while reducing missing data
+        ffill_columns = ['tsdf', 'ndf', 'indo', 'itsdo', 'indicatedGeneration', 'indicatedImbalance']
+        ffill_applied = []
+        for col in ffill_columns:
+            if col in df.columns:
+                nan_before = df[col].isna().sum()
+                if nan_before > 0:
+                    df[col] = df[col].fillna(method='ffill', limit=2)
+                    nan_after = df[col].isna().sum()
+                    filled = nan_before - nan_after
+                    if filled > 0:
+                        ffill_applied.append(f"{col} ({filled} values)")
+                        self.logger.info(f"  - Forward filled {col}: {filled} NaN values")
+
+        if ffill_applied:
+            self.logger.info(f"  - Applied forward fill (limit=2) to {len(ffill_applied)} columns")
+
         self.logger.info(f"  - Final shape: {df.shape}")
+
+        return df
+
+    def engineer_features(self, df):
+        """
+        Engineer derived features and apply time shifts to columns.
+
+        This method creates new features from existing columns and applies
+        time shifts to specific columns for forecasting purposes.
+
+        Args:
+            df: DataFrame with source data columns
+
+        Returns:
+            pd.DataFrame: DataFrame with engineered features
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Engineering Features")
+        self.logger.info("=" * 60)
+
+        # Track which features were created
+        features_created = []
+        features_skipped = []
+
+        # 1. Create derived features
+        self.logger.info("Creating derived features...")
+
+        # indo_ndf = indo - ndf
+        if 'indo' in df.columns and 'ndf' in df.columns:
+            df['indo_ndf'] = df['indo'] - df['ndf']
+            features_created.append('indo_ndf')
+            self.logger.info("  ✓ Created: indo_ndf = indo - ndf")
+        else:
+            features_skipped.append('indo_ndf (missing: indo or ndf)')
+            self.logger.warning("  ✗ Skipped: indo_ndf (missing required columns)")
+
+        # itsdo_tsdf = itsdo - tsdf
+        if 'itsdo' in df.columns and 'tsdf' in df.columns:
+            df['itsdo_tsdf'] = df['itsdo'] - df['tsdf']
+            features_created.append('itsdo_tsdf')
+            self.logger.info("  ✓ Created: itsdo_tsdf = itsdo - tsdf")
+        else:
+            features_skipped.append('itsdo_tsdf (missing: itsdo or tsdf)')
+            self.logger.warning("  ✗ Skipped: itsdo_tsdf (missing required columns)")
+
+        # totalProduction = totalProduction - totalBSAD
+        if 'totalProduction' in df.columns and 'totalBSAD' in df.columns:
+            df['totalProduction'] = df['totalProduction'] - df['totalBSAD']
+            self.logger.info("  ✓ Adjusted: totalProduction = totalProduction - totalBSAD")
+        elif 'totalProduction' in df.columns:
+            self.logger.warning("  ⚠ totalBSAD not found, totalProduction not adjusted")
+        else:
+            features_skipped.append('totalProduction adjustment (missing: totalProduction)')
+            self.logger.warning("  ✗ Skipped: totalProduction adjustment (missing column)")
+
+        # prodError = ndf - totalProduction
+        if 'ndf' in df.columns and 'totalProduction' in df.columns:
+            df['prodError'] = df['ndf'] - df['totalProduction']
+            features_created.append('prodError')
+            self.logger.info("  ✓ Created: prodError = ndf - totalProduction")
+        else:
+            features_skipped.append('prodError (missing: ndf or totalProduction)')
+            self.logger.warning("  ✗ Skipped: prodError (missing required columns)")
+
+        # modelError = netImbalanceVolume - prodError
+        if 'netImbalanceVolume' in df.columns and 'prodError' in df.columns:
+            df['modelError'] = df['netImbalanceVolume'] - df['prodError']
+            features_created.append('modelError')
+            self.logger.info("  ✓ Created: modelError = netImbalanceVolume - prodError")
+        else:
+            features_skipped.append('modelError (missing: netImbalanceVolume or prodError)')
+            self.logger.warning("  ✗ Skipped: modelError (missing required columns)")
+
+        # prodErrorAdj = prodError + modelError.shift(2)
+        if 'prodError' in df.columns and 'modelError' in df.columns:
+            df['prodErrorAdj'] = df['prodError'] + df['modelError'].shift(2)
+            features_created.append('prodErrorAdj')
+            self.logger.info("  ✓ Created: prodErrorAdj = prodError + modelError.shift(2)")
+        else:
+            features_skipped.append('prodErrorAdj (missing: prodError or modelError)')
+            self.logger.warning("  ✗ Skipped: prodErrorAdj (missing required columns)")
+
+        # HH_NET_SUM = netImbalanceVolume.shift(2)
+        if 'netImbalanceVolume' in df.columns:
+            df['HH_NET_SUM'] = df['netImbalanceVolume'].shift(2)
+            features_created.append('HH_NET_SUM')
+            self.logger.info("  ✓ Created: HH_NET_SUM = netImbalanceVolume.shift(2)")
+        else:
+            features_skipped.append('HH_NET_SUM (missing: netImbalanceVolume)')
+            self.logger.warning("  ✗ Skipped: HH_NET_SUM (missing required column)")
+
+        # 2. Apply time shifts to columns
+        self.logger.info("\nApplying time shifts (shift by 2)...")
+
+        shift_columns = ['indo', 'indo_ndf', 'modelError', 'itsdo', 'itsdo_tsdf']
+        for col in shift_columns:
+            if col in df.columns:
+                df[col] = df[col].shift(2)
+                self.logger.info(f"  ✓ Shifted: {col} = {col}.shift(2)")
+            else:
+                self.logger.warning(f"  ✗ Skipped shift: {col} (column not found)")
+
+        # 3. Rename netImbalanceVolume to premium
+        self.logger.info("\nRenaming columns...")
+        if 'netImbalanceVolume' in df.columns:
+            df = df.rename(columns={'netImbalanceVolume': 'premium'})
+            self.logger.info("  ✓ Renamed: netImbalanceVolume → premium")
+        else:
+            self.logger.warning("  ✗ Skipped rename: netImbalanceVolume not found")
+
+        # Summary
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("Feature Engineering Summary")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Features created: {len(features_created)}")
+        for feat in features_created:
+            self.logger.info(f"  • {feat}")
+
+        if features_skipped:
+            self.logger.info(f"\nFeatures skipped: {len(features_skipped)}")
+            for feat in features_skipped:
+                self.logger.info(f"  • {feat}")
+
+        self.logger.info(f"\nFinal shape: {df.shape}")
+        self.logger.info("=" * 60)
+
+        return df
+
+    def remove_nans(self, df, require_premium=False):
+        """
+        Remove rows with NaN values after feature engineering.
+
+        This must be called AFTER engineer_features() to preserve lag alignment.
+        Removing NaNs before feature engineering would break the temporal relationship
+        of lag features (e.g., lag 48 should be exactly 48 periods ago).
+
+        Args:
+            df: DataFrame after feature engineering
+            require_premium: If True, also require premium column to be non-NaN
+
+        Returns:
+            pd.DataFrame: Dataset with NaN rows removed
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Removing NaN Rows (Post Feature Engineering)")
+        self.logger.info("=" * 60)
+
+        initial_rows = len(df)
+
+        # Drop any rows with NaN values
+        df = df.dropna()
+
+        removed_rows = initial_rows - len(df)
+        self.logger.info(f"  - Rows before: {initial_rows}")
+        self.logger.info(f"  - Rows after: {len(df)}")
+        self.logger.info(f"  - Rows removed: {removed_rows}")
+
+        if require_premium and 'premium' not in df.columns:
+            self.logger.warning("  ⚠ Warning: require_premium=True but 'premium' column not found")
+
+        self.logger.info(f"  - Final shape: {df.shape}")
+        self.logger.info("=" * 60)
 
         return df
 
@@ -1876,6 +2096,52 @@ class DataBuilder:
         df.to_csv(output_path, index=False)
         self.logger.info(f"✓ Dataset saved to {output_path}")
         self.logger.info(f"  - {len(df)} rows, {len(df.columns)} columns")
+
+    def load_sources_parallel(self, source_numbers):
+        """
+        Load multiple data sources in parallel using ThreadPoolExecutor.
+
+        Args:
+            source_numbers: List of source numbers to load (e.g., [1, 2, 3, 4, 5, 7])
+
+        Returns:
+            dict: {source_num: dataframe} for successfully loaded sources
+        """
+        self.logger.info(f"\nLoading {len(source_numbers)} sources in parallel...")
+
+        def load_source_wrapper(source_num):
+            """Wrapper to load a single source and handle errors"""
+            try:
+                loader_method = getattr(self, f"load_source_{source_num}", None)
+                if loader_method is None:
+                    self.logger.warning(f"Source {source_num} not implemented, skipping...")
+                    return source_num, None
+
+                self.logger.info(f"[Source {source_num}] Starting fetch...")
+                df = loader_method()
+                self.logger.info(f"[Source {source_num}] ✓ Loaded {len(df)} rows")
+                return source_num, df
+            except Exception as e:
+                self.logger.error(f"[Source {source_num}] ✗ Failed: {e}")
+                return source_num, None
+
+        # Load all sources in parallel with max 6 workers (one per source)
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(len(source_numbers), 6)) as executor:
+            # Submit all tasks
+            future_to_source = {
+                executor.submit(load_source_wrapper, source_num): source_num
+                for source_num in source_numbers
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_source):
+                source_num, df = future.result()
+                if df is not None:
+                    results[source_num] = df
+
+        self.logger.info(f"\n✓ Parallel loading complete: {len(results)}/{len(source_numbers)} sources succeeded")
+        return results
 
     def build_dataset(self, output_path, load_sources=None, require_premium=False):
         """
@@ -1933,33 +2199,33 @@ class DataBuilder:
         if not timeseries_sources:
             raise ValueError("No time-series sources specified (only Source 6 was requested)")
 
-        # Load first time-series source as primary
-        first_source = timeseries_sources[0]
-        loader_method = getattr(self, f"load_source_{first_source}", None)
+        # Load all sources in parallel
+        source_results = self.load_sources_parallel(timeseries_sources)
 
-        if loader_method is None:
-            raise ValueError(
-                f"Source {first_source} not implemented. "
-                f"Please implement load_source_{first_source}() method in DataBuilder class."
-            )
+        if not source_results:
+            raise ValueError("No sources loaded successfully")
 
-        self.logger.info(f"\nLoading primary source {first_source}...")
-        df = loader_method()
+        # Start with first source (use lowest source number as primary)
+        primary_source = min(source_results.keys())
+        df = source_results[primary_source]
+        self.logger.info(f"\nUsing Source {primary_source} as primary dataset")
 
-        # Load and merge additional time-series sources if specified
-        for source_num in timeseries_sources[1:]:
-            self.logger.info(f"\nLoading source {source_num}...")
-            loader_method = getattr(self, f"load_source_{source_num}", None)
-
-            if loader_method is None:
-                self.logger.warning(f"Source {source_num} not implemented, skipping...")
+        # Merge other sources
+        for source_num in sorted(source_results.keys()):
+            if source_num == primary_source:
                 continue
 
-            df_additional = loader_method()
-            df = self.merge_sources(df, df_additional, merge_type='left')
+            self.logger.info(f"\nMerging Source {source_num}...")
+            df = self.merge_sources(df, source_results[source_num], merge_type='left')
 
-        # Clean the data
+        # Clean the data (validates timestamps, removes duplicates, applies forward fill)
         df = self.clean_data(df, require_premium=require_premium)
+
+        # Engineer features (create derived features and apply time shifts)
+        df = self.engineer_features(df)
+
+        # NOTE: NaN rows are NOT removed here - they will be removed in train_forecast.py
+        # AFTER lag and rolling features are created to preserve temporal alignment
 
         # Save the final dataset
         self.save_dataset(df, output_path, require_premium=require_premium)
